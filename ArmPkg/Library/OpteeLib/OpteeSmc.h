@@ -33,7 +33,7 @@
 #define OPTEE_LOGIN_PUBLIC  0x0
 
 typedef struct {
-  UINTN    Base;
+  UINT64   Base;
   UINTN    Size;
 } OPTEE_SHARED_MEMORY_INFORMATION;
 

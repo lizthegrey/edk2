@@ -15,12 +15,19 @@
 #include <Library/BaseLib.h>
 #include <Library/DebugLib.h>
 #include <Library/OpteeLib.h>
+#include <Library/DxeServicesTableLib.h>
+#include <Library/UefiRuntimeLib.h>
+#include <Library/UefiBootServicesTableLib.h>
+#include <Library/UefiRuntimeServicesTableLib.h>
 
 #include <IndustryStandard/ArmStdSmc.h>
 #include <OpteeSmc.h>
 #include <Uefi.h>
 
-STATIC OPTEE_SHARED_MEMORY_INFORMATION  OpteeSharedMemoryInformation = { 0 };
+OPTEE_SHARED_MEMORY_INFORMATION  OpteeSharedMemoryInformation = { 0 };
+
+STATIC EFI_EVENT             mSetVirtualAddressMapEvent;
+STATIC EFI_PHYSICAL_ADDRESS  mOpteeSharedPhysicalBase;
 
 /**
   Check for OP-TEE presence.
@@ -96,10 +103,50 @@ OpteeSharedMemoryRemap (
     return Status;
   }
 
-  OpteeSharedMemoryInformation.Base = (UINTN)PhysicalAddress;
+  Status = gDS->AddMemorySpace (
+                  EfiGcdMemoryTypeReserved,
+                  PhysicalAddress,
+                  Size,
+                  EFI_MEMORY_WB | EFI_MEMORY_XP | EFI_MEMORY_RUNTIME
+                  );
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "Failed to add OP-TEE comm buffer memory space\n"));
+    return Status;
+  }
+
+  Status = gDS->SetMemorySpaceAttributes (
+                  PhysicalAddress,
+                  Size,
+                  EFI_MEMORY_WB | EFI_MEMORY_XP | EFI_MEMORY_RUNTIME
+                  );
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "Failed to set OP-TEE comm buffer attributes\n"));
+    gDS->RemoveMemorySpace (PhysicalAddress, Size);
+    return Status;
+  }
+
+  OpteeSharedMemoryInformation.Base = PhysicalAddress;
+  mOpteeSharedPhysicalBase = PhysicalAddress;
   OpteeSharedMemoryInformation.Size = Size;
 
   return EFI_SUCCESS;
+}
+
+STATIC
+VOID
+EFIAPI
+NotifySetVirtualAddressMap (
+  IN EFI_EVENT  Event,
+  IN VOID       *Context
+  )
+{
+  EFI_STATUS  Status;
+
+  Status = EfiConvertPointer (
+             0x0,
+             (VOID **)&OpteeSharedMemoryInformation.Base
+             );
+  ASSERT_EFI_ERROR (Status);
 }
 
 EFI_STATUS
@@ -118,6 +165,17 @@ OpteeInit (
   Status = OpteeSharedMemoryRemap ();
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_WARN, "OP-TEE shared memory remap failed\n"));
+    return Status;
+  }
+
+  Status = gBS->CreateEvent (
+                  EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE,
+                  TPL_NOTIFY,
+                  NotifySetVirtualAddressMap,
+                  NULL,
+                  &mSetVirtualAddressMapEvent
+                  );
+  if (EFI_ERROR (Status)) {
     return Status;
   }
 
@@ -151,10 +209,16 @@ OpteeCallWithArg (
 {
   ARM_SMC_ARGS  ArmSmcArgs;
 
+  UINT64  PhysAddr;
+
   ZeroMem (&ArmSmcArgs, sizeof (ARM_SMC_ARGS));
   ArmSmcArgs.Arg0 = OPTEE_SMC_CALL_WITH_ARG;
-  ArmSmcArgs.Arg1 = (UINT32)(PhysicalArg >> 32);
-  ArmSmcArgs.Arg2 = (UINT32)PhysicalArg;
+
+  // Translate virtual address back to physical for SMC call
+  PhysAddr = (PhysicalArg - OpteeSharedMemoryInformation.Base) +
+             mOpteeSharedPhysicalBase;
+  ArmSmcArgs.Arg1 = (UINT32)(PhysAddr >> 32);
+  ArmSmcArgs.Arg2 = (UINT32)PhysAddr;
 
   while (TRUE) {
     ArmCallSmc (&ArmSmcArgs);
@@ -328,7 +392,9 @@ OpteeToMessageParam (
           (VOID *)(UINTN)InParam->Union.Memory.BufferAddress,
           InParam->Union.Memory.Size
           );
-        MessageParam->Union.Memory.BufferAddress = (UINT64)ParamSharedMemoryAddress;
+        MessageParam->Union.Memory.BufferAddress = (UINT64)(
+            (ParamSharedMemoryAddress - OpteeSharedMemoryInformation.Base) +
+            mOpteeSharedPhysicalBase);
         MessageParam->Union.Memory.Size          = InParam->Union.Memory.Size;
 
         Size = (InParam->Union.Memory.Size + sizeof (UINT64) - 1) &
@@ -390,7 +456,8 @@ OpteeFromMessageParam (
 
         CopyMem (
           (VOID *)(UINTN)OutParam->Union.Memory.BufferAddress,
-          (VOID *)(UINTN)MessageParam->Union.Memory.BufferAddress,
+          (VOID *)(UINTN)((MessageParam->Union.Memory.BufferAddress -
+              mOpteeSharedPhysicalBase) + OpteeSharedMemoryInformation.Base),
           MessageParam->Union.Memory.Size
           );
         OutParam->Union.Memory.Size = MessageParam->Union.Memory.Size;
